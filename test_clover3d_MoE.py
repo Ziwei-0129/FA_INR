@@ -169,7 +169,7 @@ def main(args):
         for param_idx, ensumbleParam_dict in enumerate(ensembleParam_dataloader):
             pred = np.zeros(len(coords), dtype=np.float32)
             
-            params = ensumbleParam_dict['params'].reshape(1,3)
+            params = ensumbleParam_dict['params'].reshape(1,6)
             params_batch = params.repeat(args.batch_size, 1)
             params_batch = params_batch.to(device)
 
@@ -187,7 +187,7 @@ def main(args):
                 
             tend = time.time()
 
-            gt = ReadScalarBinary(ensumbleParam_dict['file_src'][0])
+            gt = ReadMPASOScalar(ensumbleParam_dict['file_src'][0]).reshape(-1,1)
             pred = pred * (dmax-dmin) + dmin
             mse = np.mean((gt - pred)**2)
             psnr = 20. * np.log10(dmax - dmin) - 10. * np.log10(mse)
