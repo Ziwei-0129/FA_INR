@@ -379,4 +379,18 @@ class DummyModule(nn.Module):
 
     def forward(self, x):
         return x
+    
 
+def fwd_mlp(model, x, c, i):
+    x, c = x.view(-1, x.shape[-1]), c.view(-1, c.shape[-1])
+    x = torch.cat((x, c), 1)
+    model_output = model(x)
+    return model_output.view(-1, 1)
+
+def fwd_mmgn_cond(model, x, c, i):
+    model_output = model(x, cond=c)
+    return model_output.view(-1, 1)
+
+def fwd_mmgn_idx(model, x, c, i):
+    model_output = model(x, idx=i)
+    return model_output.view(-1, 1)

@@ -6,9 +6,13 @@ import time
 import argparse
 from tqdm import tqdm
 import math
-
-from models.attention_MoE_mpaso import KVMemoryModel
-from models.manager_mpaso import *
+import yaml
+from models.modules import fwd_mlp, fwd_mmgn_cond, fwd_mmgn_idx
+from models.baselines.kplane import KPlaneField
+from models.baselines.coordnet import CoordNet
+from models.baselines.mmgn import MMGNet
+from models.attention_MoE_cloverleaf import KVMemoryModel
+from models.manager_cloverleaf import *
 
 # parse arguments
 def parse_args():
@@ -77,6 +81,14 @@ def parse_args():
     
     parser.add_argument("--alpha", type=float, default=0.0, help="load balance loss weighting")
     parser.add_argument("--gate-res", type=int, default=16, help="resolution of gate")
+    
+    ################## baseline arguments ##################
+    parser.add_argument("--base_model", type=str, choices=["coordnet", "kplane", "mmgn"],
+                        default=None, help="baseline model to use")
+    
+    parser.add_argument("--base_model_config", type=str, required=False,
+                        default='configs/mpas/default_models.yaml',
+                        help="path to config file (optional)")
     return parser.parse_args()
 
 def main(args):
@@ -143,33 +155,49 @@ def main(args):
     coords[:,2] = (coords[:,2] - (depth_min + depth_max) / 2.0) / ((depth_max - depth_min) / 2.0)
 
     #########################################################################################################
-    
-    " Manager network "
-    manager_net = Manager(resolution=gate_res, n_experts=n_experts)
-    
-    feat_shapes = np.ones(4, dtype=np.int32) * args.dim1d
-    inr_fg = KVMemoryModel(feat_shapes, num_entries=num_feats, key_dim=key_dim, feature_dim_3d=args.spatial_fdim, 
-                feature_dim_1d=args.param_fdim, top_K=top_K, chunk_size=chunk_size, 
-                num_hidden_layers=num_hidden_layers, mlp_encoder_dim=mlp_encoder_dim,
-                n_experts=n_experts, manager_net=manager_net)
-    
-    
+    fwd_fn = None
+    if args.base_model is not None:
+        print(f"Using base model: {args.base_model}")
+        with open(args.base_model_config, 'r') as f:
+            base_model_config = yaml.full_load(f)
+        if args.base_model == "coordnet":
+            inr_fg = CoordNet(**base_model_config[args.base_model])
+            fwd_fn = fwd_mlp
+        elif args.base_model == "kplane":
+            inr_fg = KPlaneField(**base_model_config[args.base_model])
+            fwd_fn = fwd_mlp
+        elif args.base_model == "mmgn":
+            inr_fg = MMGNet(**base_model_config[args.base_model])
+            fwd_fn = fwd_mmgn_idx
+        else:
+            raise ValueError(f"Unknown base model: {args.base_model}")
+        
+        optimizer = torch.optim.Adam(inr_fg.parameters(), lr=args.lr)
+    else:
+        " Manager network "
+        manager_net = Manager(resolution=gate_res, n_experts=n_experts)
+        
+        feat_shapes = np.ones(4, dtype=np.int32) * args.dim1d
+        inr_fg = KVMemoryModel(feat_shapes, num_entries=num_feats, key_dim=key_dim, feature_dim_3d=args.spatial_fdim, 
+                    feature_dim_1d=args.param_fdim, top_K=top_K, chunk_size=chunk_size, 
+                    num_hidden_layers=num_hidden_layers, mlp_encoder_dim=mlp_encoder_dim,
+                    n_experts=n_experts, manager_net=manager_net)
+        # Optimizer:
+        # optimizer = torch.optim.Adam(inr_fg.parameters(), lr=args.lr)
+        encoder_mlp_params = set(inr_fg.encoder_mlp_list.parameters())
+        gating_mlp_params = set(inr_fg.manager_net.parameters())
+        other_parameters = (param for param in inr_fg.parameters() if param not in encoder_mlp_params and \
+                            param not in gating_mlp_params)
+        optimizer = torch.optim.Adam([
+            {'params': inr_fg.manager_net.parameters(), 'lr': lr_gate},
+            {'params': inr_fg.encoder_mlp_list.parameters(), 'lr': lr_mlp},
+            {'params': other_parameters, 'lr': args.lr},
+        ])
+        
     if args.start_epoch > 0:
         inr_fg.load_state_dict(torch.load(os.path.join(args.dir_weights, "fg_model_" + network_str + '_'+ str(args.start_epoch) + ".pth")))
     inr_fg.to(device)
-    
-    # Optimizer:
-    # optimizer = torch.optim.Adam(inr_fg.parameters(), lr=args.lr)
-    encoder_mlp_params = set(inr_fg.encoder_mlp_list.parameters())
-    gating_mlp_params = set(inr_fg.manager_net.parameters())
-    other_parameters = (param for param in inr_fg.parameters() if param not in encoder_mlp_params and \
-                        param not in gating_mlp_params)
-    optimizer = torch.optim.Adam([
-        {'params': inr_fg.manager_net.parameters(), 'lr': lr_gate},
-        {'params': inr_fg.encoder_mlp_list.parameters(), 'lr': lr_mlp},
-        {'params': other_parameters, 'lr': args.lr},
-    ])
-    
+
     if args.loss == 'MSE':
         print('Use MSE Loss')
         criterion = torch.nn.MSELoss()
@@ -224,7 +252,9 @@ def main(args):
             params_batch = None
             errsum = 0
             # Load and compute importance map
+            batch_e_indices = []
             for eidx in range(nEnsemble):
+                batch_e_indices.append(e_rndidx[egidx*nEnsemble + eidx])
                 curr_scalar_field = ReadMPASOScalar(data_dicts[e_rndidx[egidx*nEnsemble + eidx]]['file_src'])
                 curr_scalar_field = (curr_scalar_field-dmin) / (dmax-dmin)
                 curr_scalar_field = torch.from_numpy(curr_scalar_field)
@@ -258,7 +288,15 @@ def main(args):
                 coord_batch = coord_batch.to(device)
                 value_batch = value_batch.to(device)
                 # ===================forward=====================
-                model_output, probs = inr_fg(torch.cat((coord_batch, params_batch), 1), tau=1.0)
+                if args.base_model is None: # if using MoE
+                    model_output, probs = inr_fg(torch.cat((coord_batch, params_batch), 1), tau=1.0)
+                else:
+                    model_output = fwd_fn(
+                        inr_fg,
+                        coord_batch.view(nEnsemble, -1, 3),
+                        params_batch.view(nEnsemble, -1, 4),
+                        batch_e_indices
+                    )
                 loss = criterion(model_output, value_batch)
                 # ===================backward====================
                 optimizer.zero_grad()

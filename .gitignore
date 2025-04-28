@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+tmp.ipynb
+model_weights/
+
+tmp*

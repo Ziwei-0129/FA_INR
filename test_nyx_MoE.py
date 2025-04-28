@@ -92,6 +92,9 @@ def parse_args():
     
     parser.add_argument("--alpha", type=float, default=0.0, help="load balance loss weighting")
     parser.add_argument("--gate-res", type=int, default=16, help="resolution of gate")
+    
+
+    
     return parser.parse_args()
 
 def main(args):

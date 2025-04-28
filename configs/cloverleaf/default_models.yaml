@@ -1,0 +1,26 @@
+coordnet:
+    in_features: 9
+    out_features: 1
+
+mmgn:
+    in_size: 3
+    hidden_size: 256
+    latent_size: 128
+    latent_init: zeros
+    n_data: 500
+    out_size: 1 
+    n_layers: 5
+    input_scale: 256
+    alpha: 1
+    filter: Gabor
+    cond_knn: 4
+
+kplane:
+    aabb: [0, 127]
+    grid_config:
+        grid_dimensions: 2
+        input_coordinate_dim: 9
+        output_coordinate_dim: 32
+        resolution: [16, 16, 16, 25, 25, 25, 25, 25, 25]
+    concat_features_across_scales: True
+    multiscale_res: [1, 2, 4, 8]
